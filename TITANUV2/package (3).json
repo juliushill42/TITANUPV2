@@ -1,0 +1,37 @@
+{
+  "name": "titanup-v2",
+  "version": "2.0.0",
+  "description": "TitanU AI — Google Cloud Rapid Agent Hackathon Edge AI Orchestrator",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/TitanUp_V2.js",
+    "start:parallel": "node dist/TitanUp_V2.js --parallel",
+    "track1": "node dist/TitanUp_V2.js --tracks=1",
+    "track2": "node dist/TitanUp_V2.js --tracks=2",
+    "track3": "node dist/TitanUp_V2.js --tracks=3",
+    "track4": "node dist/TitanUp_V2.js --tracks=4",
+    "track5": "node dist/TitanUp_V2.js --tracks=5",
+    "dev": "tsx TitanUp_V2.ts",
+    "dev:parallel": "tsx TitanUp_V2.ts --parallel",
+    "dev:track1": "tsx TitanUp_V2.ts --tracks=1",
+    "dev:track2": "tsx TitanUp_V2.ts --tracks=2",
+    "dev:track3": "tsx TitanUp_V2.ts --tracks=3",
+    "dev:track4": "tsx TitanUp_V2.ts --tracks=4",
+    "dev:track5": "tsx TitanUp_V2.ts --tracks=5",
+    "lint": "eslint TitanUp_V2.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "@modelcontextprotocol/sdk": "^1.10.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.5.4"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+*.json.results
+titan-results-*.json
+*.log
+.DS_Store
