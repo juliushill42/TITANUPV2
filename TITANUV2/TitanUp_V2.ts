@@ -8,11 +8,12 @@
  * ║  Track 3 — MongoDB Advanced Sharding & Evolution Agent                 ║
  * ║  Track 4 — Multi-Track Data Integrator (Fivetran + Arize Phoenix)      ║
  * ║  Track 5 — Security Compliance Agent (GitLab MCP)                      ║
+ * ║  Track 6 — Orbit Blast Radius Agent (GitLab Knowledge Graph)           ║
  * ╚══════════════════════════════════════════════════════════════════════════╝
  *
  * Runtime: Node 20+ / Bun 1.1+
  * Usage:
- *   npx ts-node TitanUp_V2.ts [--parallel] [--tracks=1,2,3,4,5] \
+ *   npx ts-node TitanUp_V2.ts [--parallel] [--tracks=1,2,3,4,5,6] \
  *                              [--output=results.json] [--webhook=https://...]
  */
 
@@ -50,6 +51,7 @@ const REQUIRED_ENV = [
   "GITLAB_URL",
   "GITLAB_TOKEN",
   "GITLAB_PROJECT_ID",
+  "ORBIT_GROUP_ID",
 ] as const;
 
 for (const key of REQUIRED_ENV) {
@@ -73,6 +75,7 @@ const ENV = {
   GITLAB_URL:            process.env.GITLAB_URL!,
   GITLAB_TOKEN:          process.env.GITLAB_TOKEN!,
   GITLAB_PROJECT_ID:     process.env.GITLAB_PROJECT_ID!,
+  ORBIT_GROUP_ID:        process.env.ORBIT_GROUP_ID!,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1603,6 +1606,240 @@ EXECUTION LOOP:
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════════════
+//  TRACK 6 — ORBIT BLAST RADIUS AGENT (GITLAB KNOWLEDGE GRAPH)
+// ══════════════════════════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Real interface used: REST POST /api/v4/orbit/query, Cypher-like DSL.
+// (MCP equivalent tools: query_graph, get_graph_schema — same backend.)
+// Read-only / analytical: this agent never mutates the graph, only the MR.
+
+const ORBIT_FUNCTIONS: FunctionDeclaration[] = [
+  {
+    name: "list_open_mrs",
+    description: "List all open merge requests for the GitLab project",
+    parameters: {
+      type: "object",
+      properties: {
+        projectId: { type: "string" },
+        limit: { type: "number" },
+      },
+      required: ["projectId"],
+    },
+  },
+  {
+    name: "get_mr_changed_files",
+    description: "Get the list of file paths changed in a merge request",
+    parameters: {
+      type: "object",
+      properties: {
+        projectId: { type: "string" },
+        mrIid: { type: "number" },
+      },
+      required: ["projectId", "mrIid"],
+    },
+  },
+  {
+    name: "get_graph_schema",
+    description: "Fetch the Orbit knowledge graph node/edge schema so queries target real labels",
+    parameters: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "query_graph",
+    description: "Run a Cypher-like query against the Orbit knowledge graph for a top-level group. Use this to find callers/dependents (blast radius) of a changed file or symbol, and whether tests cover it.",
+    parameters: {
+      type: "object",
+      properties: {
+        groupId: { type: "string" },
+        query: { type: "string", description: "Cypher-like pattern, e.g. MATCH (f:File {path:'app/foo.rb'})<-[:IMPORTS*1..3]-(dep) RETURN dep" },
+        params: { type: "object" },
+      },
+      required: ["groupId", "query"],
+    },
+  },
+  {
+    name: "post_blast_radius_comment",
+    description: "Post a summary note on the MR listing blast-radius risk derived from the graph",
+    parameters: {
+      type: "object",
+      properties: {
+        projectId: { type: "string" },
+        mrIid: { type: "number" },
+        body: { type: "string" },
+      },
+      required: ["projectId", "mrIid", "body"],
+    },
+  },
+  {
+    name: "create_blast_radius_issue",
+    description: "Open a GitLab issue flagging a high blast-radius change with no test coverage",
+    parameters: {
+      type: "object",
+      properties: {
+        projectId: { type: "string" },
+        title: { type: "string" },
+        description: { type: "string" },
+        labels: { type: "array", items: { type: "string" } },
+      },
+      required: ["projectId", "title", "description"],
+    },
+  },
+];
+
+interface BlastRadiusNode { id: string; label: string; path?: string; name?: string; hasTests?: boolean; }
+
+class OrbitBlastRadiusAgent extends TitanEdgeAgent {
+  private chat: ReturnType<ReturnType<typeof buildModel>["startChat"]> | null = null;
+
+  constructor() { super("Orbit Blast Radius Agent", 6, 24, 900); }
+
+  async connect(): Promise<void> {
+    const m = buildModel(
+      `You are a Principal Code Risk Engineer. You assess merge requests using the GitLab Orbit
+knowledge graph instead of manually walking imports file-by-file.
+
+EXECUTION LOOP:
+1. list_open_mrs for projectId=${ENV.GITLAB_PROJECT_ID}.
+2. For each MR: get_mr_changed_files to get the changed paths.
+3. get_graph_schema once at the start of the run so query_graph patterns use real labels/edges.
+4. For each changed file, query_graph with groupId=${ENV.ORBIT_GROUP_ID} using a bounded
+   variable-length traversal (1..3 hops) to find every node that imports/calls/depends on it,
+   e.g.: MATCH (f:File {path:$path})<-[:IMPORTS|CALLS*1..3]-(dep) RETURN dep
+5. Compute blast radius = count of distinct dependent nodes per changed file.
+   RISK THRESHOLD: blastRadius > 10 dependents AND no associated test file in the dependents set
+   → HIGH_RISK_UNCOVERED_CHANGE.
+6. post_blast_radius_comment on the MR summarizing: file, blastRadius count, top dependents,
+   whether tests cover the area.
+7. For HIGH_RISK_UNCOVERED_CHANGE: create_blast_radius_issue with labels
+   ["risk","blast-radius","needs-tests"] describing the dependents at risk.
+8. Output JSON: { mrsAnalyzed, filesAnalyzed, highRiskChanges:[{ file, blastRadius, mrIid }],
+   queriesRun }
+
+RULES: Only use query_graph results as evidence. Never assume blast radius without a query result.`,
+      ORBIT_FUNCTIONS
+    );
+    this.chat = m.startChat({ history: [] });
+  }
+
+  private async gl(path: string, method = "GET", body?: unknown): Promise<unknown> {
+    const base = ENV.GITLAB_URL.replace(/\/$/, "");
+    const r = await fetch(`${base}/api/v4${path}`, {
+      method,
+      headers: { "PRIVATE-TOKEN": ENV.GITLAB_TOKEN, "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (!r.ok) throw new Error(`GitLab ${method} ${path} → ${r.status}: ${await r.text()}`);
+    if (r.status === 204) return {};
+    return r.json();
+  }
+
+  private async orbit(body: Record<string, unknown>): Promise<unknown> {
+    const base = ENV.GITLAB_URL.replace(/\/$/, "");
+    const r = await fetch(`${base}/api/v4/orbit/query`, {
+      method: "POST",
+      headers: { "PRIVATE-TOKEN": ENV.GITLAB_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(`Orbit query → ${r.status}: ${await r.text()}`);
+    return r.json();
+  }
+
+  private async dispatch(tool: string, args: Record<string, unknown>): Promise<unknown> {
+    const t = Date.now();
+    let out: unknown;
+    const pid = encodeURIComponent(String(args.projectId ?? ENV.GITLAB_PROJECT_ID));
+
+    switch (tool) {
+      case "list_open_mrs": {
+        const p = new URLSearchParams({ state: "opened", per_page: String(args.limit ?? 20) });
+        out = await this.gl(`/projects/${pid}/merge_requests?${p}`);
+        break;
+      }
+      case "get_mr_changed_files": {
+        const diffs = await this.gl(`/projects/${pid}/merge_requests/${args.mrIid}/diffs`) as Array<{ new_path: string }>;
+        out = { paths: diffs.map((d) => d.new_path) };
+        break;
+      }
+      case "get_graph_schema": {
+        out = await this.orbit({ group_id: ENV.ORBIT_GROUP_ID, op: "schema" });
+        break;
+      }
+      case "query_graph": {
+        out = await this.orbit({
+          group_id: String(args.groupId ?? ENV.ORBIT_GROUP_ID),
+          query: args.query,
+          params: args.params ?? {},
+        });
+        const nodes = ((out as { nodes?: BlastRadiusNode[] }).nodes ?? []);
+        if (nodes.length > 10) {
+          const untested = nodes.every((n) => !n.hasTests);
+          this.finding({
+            severity: untested ? "high" : "medium",
+            category: "orbit_blast_radius",
+            message: `Blast radius ${nodes.length} dependents found via graph query${untested ? " (no test coverage detected)" : ""}`,
+            evidence: { query: args.query, dependentCount: nodes.length, untested },
+          });
+        }
+        break;
+      }
+      case "post_blast_radius_comment": {
+        out = await this.gl(`/projects/${pid}/merge_requests/${args.mrIid}/notes`, "POST", { body: args.body });
+        this.remediation({ type: "blast_radius_comment_posted", description: `Blast radius summary posted on MR !${args.mrIid}`, automated: true, result: out });
+        break;
+      }
+      case "create_blast_radius_issue": {
+        out = await this.gl(`/projects/${pid}/issues`, "POST", {
+          title: args.title,
+          description: args.description,
+          labels: (args.labels as string[] ?? []).join(","),
+        });
+        this.remediation({ type: "blast_radius_issue_created", description: `Issue created: ${args.title}`, automated: true, result: out });
+        break;
+      }
+      default: throw new Error(`Unknown Orbit tool: ${tool}`);
+    }
+
+    this.record(tool, args, out, Date.now() - t);
+    return out;
+  }
+
+  async run(): Promise<AgentResult> {
+    const t0 = Date.now();
+    if (!this.chat) await this.connect();
+    try {
+      let resp = await this.chat!.sendMessage(
+        `BEGIN BLAST_RADIUS_SWEEP for project ${ENV.GITLAB_PROJECT_ID}, group ${ENV.ORBIT_GROUP_ID}. List open MRs, get changed files, query the Orbit graph for dependents of each file, flag high-risk uncovered changes, comment and file issues. Output the JSON summary.`
+      );
+      for (let i = 0; i < this.maxIterations; i++) {
+        const parts = resp.response.candidates?.[0]?.content?.parts ?? [];
+        const fns = parts.filter((p: Part) => (p as { functionCall?: unknown }).functionCall);
+        if (fns.length === 0) {
+          const txt = (parts.find((p: Part) => (p as { text?: string }).text) as { text?: string });
+          if (txt?.text) this.finding({ severity: "info", category: "blast_radius_summary", message: txt.text, evidence: { iter: i } });
+          break;
+        }
+        const results: Part[] = [];
+        for (const part of fns) {
+          const fc = (part as { functionCall: { name: string; args: Record<string, unknown> } }).functionCall;
+          try {
+            const r = await this.dispatch(fc.name, fc.args);
+            results.push({ functionResponse: { name: fc.name, response: { content: JSON.stringify(r) } } } as Part);
+          } catch (e) {
+            results.push({ functionResponse: { name: fc.name, response: { content: `Error: ${(e as Error).message}` } } } as Part);
+          }
+        }
+        resp = await this.chat!.sendMessage(results);
+        await sleep(this.iterDelayMs);
+      }
+      return this.result(true, Date.now() - t0);
+    } catch (e) {
+      return this.result(false, Date.now() - t0, (e as Error).message);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
 //  TITAN ORCHESTRATOR
 // ══════════════════════════════════════════════════════════════════════════════
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1620,6 +1857,7 @@ const AGENT_REGISTRY: Map<number, () => TitanEdgeAgent> = new Map([
   [3, () => new MongoDBShardingEvolutionAgent()],
   [4, () => new FivetranArizeIntegratorAgent()],
   [5, () => new GitLabSecurityComplianceAgent()],
+  [6, () => new OrbitBlastRadiusAgent()],
 ]);
 
 class TitanOrchestrator {
@@ -1730,7 +1968,7 @@ class TitanOrchestrator {
   const argv = process.argv.slice(2);
   const parallel   = argv.includes("--parallel");
   const tracksArg  = argv.find((a) => a.startsWith("--tracks="));
-  const tracks     = tracksArg ? tracksArg.replace("--tracks=", "").split(",").map(Number) : [1, 2, 3, 4, 5];
+  const tracks     = tracksArg ? tracksArg.replace("--tracks=", "").split(",").map(Number) : [1, 2, 3, 4, 5, 6];
   const outputFile = argv.find((a) => a.startsWith("--output="))?.replace("--output=", "") ?? `titan-results-${Date.now()}.json`;
   const webhookUrl = argv.find((a) => a.startsWith("--webhook="))?.replace("--webhook=", "");
 
